@@ -20,7 +20,11 @@ const ALLOWED_STATUS = ["pending", "approved", "rejected"];
 const MAX_ID_PHOTO_BYTES = 750 * 1024;
 
 // Membership fee in paise (₹100 -> 10000). Set MEMBERSHIP_FEE in .env
-const FEE_PAISE = Math.round(Number(process.env.MEMBERSHIP_FEE || 100) * 100);
+// Read when needed (not at startup) so it never depends on when .env is loaded.
+const getFeePaise = () => {
+  const rupees = Number(process.env.MEMBERSHIP_FEE);
+  return Math.round((rupees > 0 ? rupees : 100) * 100);
+};
 
 const uploadsDir = path.join(__dirname, "..", "..", "uploads");
 
@@ -75,6 +79,11 @@ const getPhotoForCard = async (photoUrl) => {
   } catch {
     return null;
   }
+};
+
+// GET /api/members/fee — public. Lets the form show the real fee on the button.
+const getFee = async (request, reply) => {
+  return reply.send({ success: true, amount: getFeePaise() / 100 });
 };
 
 const getAll = async (request, reply) => {
@@ -212,7 +221,7 @@ const createOrder = async (request, reply) => {
     }
 
     const order = await razorpay.orders.create({
-      amount: FEE_PAISE,
+      amount: getFeePaise(),
       currency: "INR",
       receipt: `mem_${member.id}_${Date.now()}`,
       notes: { member_id: String(member.id) },
@@ -296,7 +305,7 @@ const verifyPayment = async (request, reply) => {
 
     if (
       payment.order_id !== razorpay_order_id ||
-      payment.amount !== FEE_PAISE ||
+      payment.amount !== getFeePaise() ||
       !["captured", "authorized"].includes(payment.status)
     ) {
       return reply
@@ -538,6 +547,7 @@ const uploadIdPhoto = async (request, reply) => {
 
 module.exports = {
   getAll,
+  getFee,
   create,
   createOrder,
   verifyPayment,

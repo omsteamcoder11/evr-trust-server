@@ -5,6 +5,9 @@ module.exports = async (fastify) => {
   // GET ALL - ADMIN ONLY
   fastify.get("/", { preHandler: [auth] }, memberController.getAll);
 
+  // MEMBERSHIP FEE - PUBLIC (the form shows it on the Pay button)
+  fastify.get("/fee", memberController.getFee);
+
   // ID PHOTO UPLOAD - PUBLIC (applicants aren't logged in)
   fastify.post("/upload", memberController.uploadIdPhoto);
 
