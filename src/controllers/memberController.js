@@ -13,7 +13,8 @@ const {
   resetMemberNumbers,
 } = require("../models/memberModel");
 const { generateIdCard } = require("../lib/idCard");
-const { sendIdCardLink } = require("../lib/mailer");
+const { uploadToR2 } = require("../lib/r2");
+const { sendIdCardLink, sendAdminNotification } = require("../lib/mailer");
 
 const ALLOWED_STATUS = ["pending", "approved", "rejected"];
 const MAX_ID_PHOTO_BYTES = 750 * 1024;
@@ -54,10 +55,20 @@ const ageFromDob = (dob) => {
   return age;
 };
 
-// Finds the member's photo file on disk from the saved photo URL
-const localPhotoPath = (photoUrl) => {
+// Gets the member's photo for the ID card.
+// New photos come from R2 (a web address). Old photos may still be in uploads.
+const getPhotoForCard = async (photoUrl) => {
+  if (!photoUrl) return null;
+
   try {
-    if (!photoUrl) return null;
+    const res = await fetch(photoUrl);
+    if (res.ok) return Buffer.from(await res.arrayBuffer());
+  } catch (err) {
+    console.error("PHOTO FETCH ERROR:", err.message);
+  }
+
+  // Fallback for old photos saved in the local uploads folder
+  try {
     const file = path.basename(new URL(photoUrl).pathname);
     const full = path.join(uploadsDir, file);
     return fs.existsSync(full) ? full : null;
@@ -230,7 +241,8 @@ const createOrder = async (request, reply) => {
 };
 
 // POST /api/members/pay/:token/verify — public. Verifies the Razorpay payment.
-// No email is sent here — admin must approve first.
+// No ID card email is sent here — admin must approve first.
+// The admin gets a "new application" email instead.
 const verifyPayment = async (request, reply) => {
   try {
     const razorpay = reply.server.razorpay;
@@ -307,6 +319,15 @@ const verifyPayment = async (request, reply) => {
       });
     }
 
+    // Tell the admin about the new application.
+    // No "await": if the email fails, the member's payment still succeeds.
+    sendAdminNotification({
+      name: member.name,
+      mobile: member.mobile,
+      email: member.email,
+      membershipType: member.membership_type,
+    }).catch((err) => console.error("ADMIN NOTIFICATION ERROR:", err));
+
     return reply.send({
       success: true,
       data: { name: member.name, email: member.email },
@@ -335,13 +356,15 @@ const downloadCard = async (request, reply) => {
         .send({ success: false, error: "ID card not found" });
     }
 
+    const photo = await getPhotoForCard(member.id_photo_url);
+
     const png = await generateIdCard({
       name: member.name,
       memberNo: member.member_number,
       membershipType: member.membership_type,
       district: member.city,
       state: member.state,
-      photo: localPhotoPath(member.id_photo_url),
+      photo,
     });
 
     return reply
@@ -454,7 +477,7 @@ const resetNumbers = async (request, reply) => {
   }
 };
 
-// POST /api/members/upload — public, ID photo only, max 750KB
+// POST /api/members/upload — public, ID photo only, max 750KB. Saved in R2.
 const uploadIdPhoto = async (request, reply) => {
   try {
     const data = await request.file({
@@ -490,13 +513,21 @@ const uploadIdPhoto = async (request, reply) => {
       throw err;
     }
 
-    const fileName = `member-${Date.now()}-${crypto
-      .randomBytes(6)
-      .toString("hex")}${ext}`;
+    const mimeByExt = {
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".png": "image/png",
+      ".webp": "image/webp",
+    };
 
-    fs.writeFileSync(path.join(uploadsDir, fileName), buffer);
-
-    const url = `${request.protocol}://${request.headers.host}/uploads/${fileName}`;
+    const url = await uploadToR2(
+      {
+        originalname: data.filename,
+        buffer,
+        mimetype: data.mimetype || mimeByExt[ext],
+      },
+      "members"
+    );
 
     return reply.send({ success: true, url });
   } catch (err) {

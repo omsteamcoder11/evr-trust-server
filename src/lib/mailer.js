@@ -53,3 +53,22 @@ exports.sendIdCardLink = async ({ to, name, memberNo, downloadUrl }) => {
     `,
   });
 };
+
+// Tells the admin that a new paid application has arrived
+exports.sendAdminNotification = async ({ name, mobile, email, membershipType }) => {
+  return transporter.sendMail({
+    from: `"Evr Periyar Peravai Charitable Trust" <${process.env.SMTP_USER}>`,
+    to: process.env.NOTIFY_EMAIL,
+    subject: `New membership application: ${name}`,
+    html: `
+      <p>A new membership application has been received and paid.</p>
+      <p>
+        <b>Name:</b> ${name}<br/>
+        <b>Mobile:</b> ${mobile}<br/>
+        <b>Email:</b> ${email}<br/>
+        <b>Membership type:</b> ${membershipType}
+      </p>
+      <p>Please open the admin panel to review and approve it.</p>
+    `,
+  });
+};
