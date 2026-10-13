@@ -16,6 +16,7 @@ if (!fs.existsSync(uploadsDir)) {
 }
 
 const ALLOWED_EXT = ['.jpg', '.jpeg', '.png', '.webp', '.gif'];
+const MAX_IMAGES = 10;
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -24,10 +25,10 @@ class HttpError extends Error {
   }
 }
 
-// Reads text fields (title, category, content) and an optional image from a multipart request
+// Reads text fields (title, category, content, existing_images) and any number of images
 const parseForm = async (request) => {
   const fields = {};
-  let file = null;
+  const files = [];
   let error = null;
 
   for await (const part of request.parts()) {
@@ -39,7 +40,7 @@ const parseForm = async (request) => {
         buffer = await part.toBuffer(); // always consume the stream
       } catch (err) {
         if (err.code === 'FST_REQ_FILE_TOO_LARGE') {
-          error = error || new HttpError(400, 'Image must be under 10MB');
+          error = error || new HttpError(400, 'Each image must be under 10MB');
           continue;
         }
         throw err;
@@ -54,7 +55,7 @@ const parseForm = async (request) => {
         continue;
       }
 
-      file = { buffer, ext };
+      files.push({ buffer, ext });
     } else {
       fields[part.fieldname] = part.value;
     }
@@ -62,7 +63,7 @@ const parseForm = async (request) => {
 
   if (error) throw error;
 
-  return { fields, file };
+  return { fields, files };
 };
 
 const saveFile = ({ buffer, ext }) => {
@@ -98,7 +99,7 @@ const getAll = async (request, reply) => {
 
 const create = async (request, reply) => {
   try {
-    const { fields, file } = await parseForm(request);
+    const { fields, files } = await parseForm(request);
 
     const title = (fields.title || '').trim();
     const category = (fields.category || '').trim() || 'General';
@@ -108,12 +109,16 @@ const create = async (request, reply) => {
       throw new HttpError(400, 'Title is required');
     }
 
-    if (!file) {
-      throw new HttpError(400, 'Image is required');
+    if (!files.length) {
+      throw new HttpError(400, 'At least one image is required');
     }
 
-    const image_url = saveFile(file);
-    const data = await createActivity({ title, image_url, category, content });
+    if (files.length > MAX_IMAGES) {
+      throw new HttpError(400, `Maximum ${MAX_IMAGES} images allowed`);
+    }
+
+    const images = files.map(saveFile);
+    const data = await createActivity({ title, images, category, content });
 
     reply.status(201).send({ success: true, data });
   } catch (err) {
@@ -129,7 +134,7 @@ const update = async (request, reply) => {
       throw new HttpError(404, 'Activity not found');
     }
 
-    const { fields, file } = await parseForm(request);
+    const { fields, files } = await parseForm(request);
 
     const title =
       fields.title !== undefined ? fields.title.trim() : existing.title;
@@ -146,16 +151,43 @@ const update = async (request, reply) => {
       throw new HttpError(400, 'Title is required');
     }
 
-    const image_url = file ? saveFile(file) : existing.image_url;
+    // existing_images = JSON array of current image URLs the admin chose to keep.
+    // If not sent, all current images are kept.
+    let kept = existing.images;
+    if (fields.existing_images !== undefined) {
+      let parsed;
+      try {
+        parsed = JSON.parse(fields.existing_images);
+      } catch {
+        throw new HttpError(400, 'Invalid existing_images');
+      }
+      if (!Array.isArray(parsed)) {
+        throw new HttpError(400, 'Invalid existing_images');
+      }
+      // Only allow URLs that already belong to this activity
+      kept = existing.images.filter((url) => parsed.includes(url));
+    }
+
+    if (kept.length + files.length === 0) {
+      throw new HttpError(400, 'At least one image is required');
+    }
+
+    if (kept.length + files.length > MAX_IMAGES) {
+      throw new HttpError(400, `Maximum ${MAX_IMAGES} images allowed`);
+    }
+
+    const images = [...kept, ...files.map(saveFile)];
 
     const data = await updateActivity(request.params.id, {
       title,
-      image_url,
+      images,
       category,
       content,
     });
 
-    if (file) removeFile(existing.image_url);
+    existing.images
+      .filter((url) => !kept.includes(url))
+      .forEach(removeFile);
 
     reply.send({ success: true, data });
   } catch (err) {
@@ -169,7 +201,7 @@ const remove = async (request, reply) => {
 
     await deleteActivity(request.params.id);
 
-    if (existing) removeFile(existing.image_url);
+    if (existing) existing.images.forEach(removeFile);
 
     reply.send({ success: true, message: 'Activity deleted successfully' });
   } catch (err) {

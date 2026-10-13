@@ -1,10 +1,22 @@
 const pool = require('../config/db');
 
+// Legacy rows (before the images column) fall back to image_url
+const normalize = (row) => {
+  if (!row) return row;
+  const images =
+    Array.isArray(row.images) && row.images.length
+      ? row.images
+      : row.image_url
+      ? [row.image_url]
+      : [];
+  return { ...row, images, image_url: images[0] || row.image_url || '' };
+};
+
 const getAllActivities = async () => {
   const result = await pool.query(
     'SELECT * FROM activities ORDER BY created_at DESC'
   );
-  return result.rows;
+  return result.rows.map(normalize);
 };
 
 const getActivityById = async (id) => {
@@ -12,27 +24,27 @@ const getActivityById = async (id) => {
     'SELECT * FROM activities WHERE id = $1',
     [id]
   );
-  return result.rows[0];
+  return normalize(result.rows[0]);
 };
 
-const createActivity = async ({ title, image_url, category, content }) => {
+const createActivity = async ({ title, images, category, content }) => {
   const result = await pool.query(
-    `INSERT INTO activities (title, image_url, category, content)
-     VALUES ($1, $2, $3, $4) RETURNING *`,
-    [title, image_url, category, content || '']
+    `INSERT INTO activities (title, image_url, images, category, content)
+     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    [title, images[0], images, category, content || '']
   );
-  return result.rows[0];
+  return normalize(result.rows[0]);
 };
 
-const updateActivity = async (id, { title, image_url, category, content }) => {
+const updateActivity = async (id, { title, images, category, content }) => {
   const result = await pool.query(
     `UPDATE activities
-     SET title = $1, image_url = $2, category = $3, content = $4
-     WHERE id = $5
+     SET title = $1, image_url = $2, images = $3, category = $4, content = $5
+     WHERE id = $6
      RETURNING *`,
-    [title, image_url, category, content || '', id]
+    [title, images[0], images, category, content || '', id]
   );
-  return result.rows[0];
+  return normalize(result.rows[0]);
 };
 
 const deleteActivity = async (id) => {

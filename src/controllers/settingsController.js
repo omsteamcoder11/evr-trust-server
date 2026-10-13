@@ -7,6 +7,9 @@ const cleanUrl = (value) => {
   return /^https?:\/\//i.test(v) ? v : `https://${v}`;
 };
 
+// Script/tag fields are stored exactly as entered (no trimming of inner content).
+const cleanCode = (value) => (typeof value === "string" ? value : "");
+
 exports.getSettings = async (request, reply) => {
   try {
     const result = await db.query(
@@ -24,6 +27,9 @@ exports.getSettings = async (request, reply) => {
         facebook: row.facebook || "",
         instagram: row.instagram || "",
         youtube: row.youtube || "",
+        header_scripts: row.header_scripts || "",
+        body_scripts: row.body_scripts || "",
+        footer_scripts: row.footer_scripts || "",
       },
     });
   } catch (err) {
@@ -37,6 +43,9 @@ exports.updateSettings = async (request, reply) => {
     const facebook = cleanUrl(request.body.facebook);
     const instagram = cleanUrl(request.body.instagram);
     const youtube = cleanUrl(request.body.youtube);
+    const headerScripts = cleanCode(request.body.header_scripts);
+    const bodyScripts = cleanCode(request.body.body_scripts);
+    const footerScripts = cleanCode(request.body.footer_scripts);
 
     const existing = await db.query(
       "SELECT id FROM site_settings ORDER BY id DESC LIMIT 1"
@@ -45,9 +54,11 @@ exports.updateSettings = async (request, reply) => {
     if (existing.rows.length === 0) {
       await db.query(
         `INSERT INTO site_settings
-           (address, office_phone, whatsapp_number, email, facebook, instagram, youtube)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        [address, phone, whatsapp, email, facebook, instagram, youtube]
+           (address, office_phone, whatsapp_number, email, facebook, instagram, youtube,
+            header_scripts, body_scripts, footer_scripts)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [address, phone, whatsapp, email, facebook, instagram, youtube,
+         headerScripts, bodyScripts, footerScripts]
       );
     } else {
       await db.query(
@@ -55,9 +66,11 @@ exports.updateSettings = async (request, reply) => {
            address = $1, office_phone = $2,
            whatsapp_number = $3, email = $4,
            facebook = $5, instagram = $6, youtube = $7,
+           header_scripts = $8, body_scripts = $9, footer_scripts = $10,
            updated_at = NOW()
-         WHERE id = $8`,
-        [address, phone, whatsapp, email, facebook, instagram, youtube, existing.rows[0].id]
+         WHERE id = $11`,
+        [address, phone, whatsapp, email, facebook, instagram, youtube,
+         headerScripts, bodyScripts, footerScripts, existing.rows[0].id]
       );
     }
 
