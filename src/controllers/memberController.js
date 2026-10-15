@@ -1,6 +1,7 @@
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+const sharp = require("sharp");
 const {
   getAllMembers,
   createMember,
@@ -14,6 +15,7 @@ const {
 } = require("../models/memberModel");
 const { generateIdCard } = require("../lib/idCard");
 const { sendIdCardLink } = require("../lib/mailer");
+const { uploadToR2, deleteFromR2 } = require("../lib/r2");
 
 const ALLOWED_STATUS = ["pending", "approved", "rejected"];
 const MAX_ID_PHOTO_BYTES = 750 * 1024;
@@ -62,6 +64,31 @@ const localPhotoPath = (photoUrl) => {
     const full = path.join(uploadsDir, file);
     return fs.existsSync(full) ? full : null;
   } catch {
+    return null;
+  }
+};
+
+// True if the saved photo URL points to R2 (new photos). Old photos are local.
+const isR2Url = (url) =>
+  !!url &&
+  !!process.env.R2_PUBLIC_URL &&
+  url.startsWith(process.env.R2_PUBLIC_URL);
+
+// Gives the ID card generator the photo: downloads it from R2, or uses the
+// old local file for members registered before the move to R2.
+const loadCardPhoto = async (photoUrl) => {
+  try {
+    if (!photoUrl) return null;
+
+    if (isR2Url(photoUrl)) {
+      const res = await fetch(photoUrl);
+      if (!res.ok) return null;
+      return Buffer.from(await res.arrayBuffer());
+    }
+
+    return localPhotoPath(photoUrl);
+  } catch (err) {
+    console.error("LOAD CARD PHOTO ERROR:", err.message);
     return null;
   }
 };
@@ -341,16 +368,19 @@ const downloadCard = async (request, reply) => {
       membershipType: member.membership_type,
       district: member.city,
       state: member.state,
-      photo: localPhotoPath(member.id_photo_url),
+      photo: await loadCardPhoto(member.id_photo_url),
     });
 
+    // Convert the card to WebP (high quality so the text stays sharp)
+    const webp = await sharp(png).webp({ quality: 95 }).toBuffer();
+
     return reply
-      .header("Content-Type", "image/png")
+      .header("Content-Type", "image/webp")
       .header(
         "Content-Disposition",
-        `attachment; filename="EVR-ID-${member.member_number}.png"`
+        `attachment; filename="EVR-ID-${member.member_number}.webp"`
       )
-      .send(png);
+      .send(webp);
   } catch (err) {
     console.error("DOWNLOAD CARD ERROR:", err);
     return reply.status(500).send({ success: false, error: err.message });
@@ -416,9 +446,30 @@ const updateStatus = async (request, reply) => {
   }
 };
 
+// DELETE /api/members/:id — admin only. Also removes the photo file from disk.
 const remove = async (request, reply) => {
   try {
+    // Load the member first so we know which photo file to delete
+    const member = await getMemberById(request.params.id);
+
     await deleteMember(request.params.id);
+
+    // Delete the photo: from R2 (new members) or the uploads folder (old ones)
+    if (member) {
+      if (isR2Url(member.id_photo_url)) {
+        await deleteFromR2(member.id_photo_url);
+      } else {
+        const photoFile = localPhotoPath(member.id_photo_url);
+        if (photoFile) {
+          try {
+            fs.unlinkSync(photoFile);
+          } catch (e) {
+            console.error("DELETE PHOTO FILE ERROR:", e.message);
+          }
+        }
+      }
+    }
+
     return reply.send({ success: true, message: "Member deleted successfully" });
   } catch (err) {
     console.error("DELETE MEMBER ERROR:", err);
@@ -490,19 +541,39 @@ const uploadIdPhoto = async (request, reply) => {
       throw err;
     }
 
-    const fileName = `member-${Date.now()}-${crypto
-      .randomBytes(6)
-      .toString("hex")}${ext}`;
+    // Convert the photo to WebP (the ID card generator reads WebP fine)
+    let webp;
+    try {
+      webp = await sharp(buffer)
+        .rotate() // respect phone camera orientation
+        .resize({ width: 900, withoutEnlargement: true })
+        .webp({ quality: 85 })
+        .toBuffer();
+    } catch (convErr) {
+      return reply.status(400).send({
+        success: false,
+        error: "This file is not a valid image",
+      });
+    }
 
-    fs.writeFileSync(path.join(uploadsDir, fileName), buffer);
+    // Save to R2 in the "members" folder (already WebP, so it's stored as is)
+    const url = await uploadToR2(
+      { buffer: webp, mimetype: "image/webp", originalname: "photo.webp" },
+      "members"
+    );
 
-    const url = `${request.protocol}://${request.headers.host}/uploads/${fileName}`;
+    console.log("MEMBER PHOTO SAVED TO R2:", url);
 
     return reply.send({ success: true, url });
   } catch (err) {
     console.error("UPLOAD ID PHOTO ERROR:", err);
     return reply.status(500).send({ success: false, error: err.message });
   }
+};
+
+// GET /api/members/fee — public. Returns the membership fee in rupees.
+const getFee = async (request, reply) => {
+  return reply.send({ success: true, amount: FEE_PAISE / 100 });
 };
 
 module.exports = {
@@ -515,4 +586,5 @@ module.exports = {
   remove,
   resetNumbers,
   uploadIdPhoto,
+  getFee,
 };

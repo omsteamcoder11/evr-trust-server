@@ -29,6 +29,8 @@ exports.getGallery = async (req, reply) => {
     const data = await Gallery.getAll();
     return reply.send({ success: true, data });
   } catch (err) {
+        console.error('Upload error:', err);   // <-- add this line
+
     return reply.status(500).send({ success: false, error: err.message });
   }
 };

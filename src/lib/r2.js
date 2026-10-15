@@ -2,6 +2,7 @@ const { S3Client, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { Upload } = require('@aws-sdk/lib-storage');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
+const sharp = require('sharp');
 
 const s3 = new S3Client({
   region: 'auto',
@@ -12,8 +13,24 @@ const s3 = new S3Client({
   },
 });
 
+// Image types that get converted to WebP
+const CONVERTIBLE = ['image/jpeg', 'image/png', 'image/gif'];
+
 const uploadToR2 = async (file, folder = 'activities') => {
-  const ext = path.extname(file.originalname).toLowerCase();
+  let body = file.buffer;
+  let contentType = file.mimetype;
+  let ext = path.extname(file.originalname).toLowerCase();
+
+  if (CONVERTIBLE.includes(file.mimetype)) {
+    body = await sharp(file.buffer, { animated: file.mimetype === 'image/gif' })
+      .rotate() // respect EXIF orientation
+      .resize({ width: 1920, withoutEnlargement: true }) // optional size cap
+      .webp({ quality: 80 })
+      .toBuffer();
+    contentType = 'image/webp';
+    ext = '.webp';
+  }
+
   const key = `${folder}/${uuidv4()}${ext}`;
 
   const upload = new Upload({
@@ -21,8 +38,8 @@ const uploadToR2 = async (file, folder = 'activities') => {
     params: {
       Bucket: process.env.R2_BUCKET_NAME,
       Key: key,
-      Body: file.buffer,
-      ContentType: file.mimetype,
+      Body: body,
+      ContentType: contentType,
     },
   });
 
