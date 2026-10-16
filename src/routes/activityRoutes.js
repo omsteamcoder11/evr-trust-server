@@ -16,6 +16,36 @@ const normalize = (row) => {
   return { ...row, images, image_url: images[0] || row.image_url || '' };
 };
 
+const slugify = (text) =>
+  (text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80)
+    .replace(/-+$/g, '') || 'activity';
+
+// Adds -2, -3 ... if the slug is already taken by another activity
+const uniqueSlug = async (title, excludeId = null) => {
+  const base = slugify(title);
+  let candidate = base;
+  let n = 1;
+
+  while (true) {
+    const found = excludeId
+      ? await pool.query(
+          'SELECT 1 FROM activities WHERE slug = $1 AND id <> $2',
+          [candidate, excludeId]
+        )
+      : await pool.query(
+          'SELECT 1 FROM activities WHERE slug = $1',
+          [candidate]
+        );
+    if (!found.rowCount) return candidate;
+    n += 1;
+    candidate = `${base}-${n}`;
+  }
+};
+
 // Reads text fields and every uploaded image. Always consumes every file stream.
 const parseForm = async (req) => {
   const fields = {};
@@ -55,6 +85,17 @@ const parseForm = async (req) => {
   return { fields, files, error };
 };
 
+// Finds every picture link inside the article. The first one is the cover.
+const extractImages = (html) => {
+  const urls = [];
+  const re = /<img[^>]+src=["']([^"']+)["']/gi;
+  let m;
+  while ((m = re.exec(html || '')) !== null) {
+    if (!urls.includes(m[1])) urls.push(m[1]);
+  }
+  return urls;
+};
+
 const uploadAll = (files) =>
   Promise.all(files.map((f) => uploadToR2(f, 'activities')));
 
@@ -72,7 +113,23 @@ module.exports = async (fastify) => {
     }
   });
 
-  // GET one activity (for the article page)
+  // GET one activity by slug (for the website article page)
+  fastify.get('/slug/:slug', async (req, reply) => {
+    try {
+      const result = await pool.query(
+        'SELECT * FROM activities WHERE slug = $1',
+        [req.params.slug]
+      );
+      if (result.rowCount === 0) {
+        return reply.status(404).send({ success: false, error: 'Activity not found' });
+      }
+      return reply.send({ success: true, data: normalize(result.rows[0]) });
+    } catch (err) {
+      return reply.status(500).send({ success: false, error: err.message });
+    }
+  });
+
+  // GET one activity by id
   fastify.get('/:id', async (req, reply) => {
     try {
       const { id } = req.params;
@@ -101,17 +158,20 @@ module.exports = async (fastify) => {
       const content = (fields.content || '').trim();
 
       if (!title) return reply.status(400).send({ error: 'Title is required' });
-      if (!files.length)
-        return reply.status(400).send({ error: 'At least one image is required' });
-      if (files.length > MAX_IMAGES)
-        return reply.status(400).send({ error: `Maximum ${MAX_IMAGES} images allowed` });
 
-      const images = await uploadAll(files);
+      // Pictures come from the article. The first one is the cover.
+      const images = extractImages(content);
+      if (!images.length)
+        return reply
+          .status(400)
+          .send({ error: 'Add at least one picture inside the article' });
+
+      const slug = await uniqueSlug(title);
 
       const result = await pool.query(
-        `INSERT INTO activities (title, category, content, image_url, images)
-         VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-        [title, category, content, images[0], images]
+        `INSERT INTO activities (title, slug, category, content, image_url, images)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [title, slug, category, content, images[0], images]
       );
 
       return reply.status(201).send({ success: true, data: normalize(result.rows[0]) });
@@ -120,7 +180,23 @@ module.exports = async (fastify) => {
     }
   });
 
-  // PUT update activity
+  // POST upload one picture for inside the article (editor picture button)
+  fastify.post('/upload-image', async (req, reply) => {
+    try {
+      const { files, error } = await parseForm(req);
+
+      if (error) return reply.status(400).send({ error });
+      if (!files.length)
+        return reply.status(400).send({ error: 'Image is required' });
+
+      const url = await uploadToR2(files[0], 'activities');
+      return reply.send({ success: true, url });
+    } catch (err) {
+      return reply.status(500).send({ error: err.message });
+    }
+  });
+
+  // PUT update activity (slug follows the title)
   fastify.put('/:id', async (req, reply) => {
     try {
       const { id } = req.params;
@@ -150,38 +226,36 @@ module.exports = async (fastify) => {
 
       if (!title) return reply.status(400).send({ error: 'Title is required' });
 
-      // existing_images = JSON array of current URLs the admin kept.
-      // If not sent, all current images are kept.
-      let kept = existing.images;
-      if (fields.existing_images !== undefined) {
-        let parsed;
-        try {
-          parsed = JSON.parse(fields.existing_images);
-        } catch {
-          return reply.status(400).send({ error: 'Invalid existing_images' });
-        }
-        if (!Array.isArray(parsed))
-          return reply.status(400).send({ error: 'Invalid existing_images' });
-        kept = existing.images.filter((url) => parsed.includes(url));
-      }
+      // Rebuild the slug when: the title changed, the slug is missing,
+      // or the saved slug does not match the title (like "hhhhhhhb")
+      const slug =
+        title !== existing.title ||
+        !existing.slug ||
+        !existing.slug.startsWith(slugify(title))
+          ? await uniqueSlug(title, id)
+          : existing.slug;
 
-      if (kept.length + files.length === 0)
-        return reply.status(400).send({ error: 'At least one image is required' });
-      if (kept.length + files.length > MAX_IMAGES)
-        return reply.status(400).send({ error: `Maximum ${MAX_IMAGES} images allowed` });
+      // Pictures come from the article (first one = cover).
+      // If the article has no pictures, keep the old photos of this activity.
+      const fromArticle = extractImages(content);
+      const images = fromArticle.length ? fromArticle : existing.images;
 
-      const uploaded = await uploadAll(files);
-      const images = [...kept, ...uploaded];
+      if (!images.length)
+        return reply
+          .status(400)
+          .send({ error: 'Add at least one picture inside the article' });
 
       const result = await pool.query(
         `UPDATE activities
-         SET title=$1, category=$2, content=$3, image_url=$4, images=$5
-         WHERE id=$6 RETURNING *`,
-        [title, category, content, images[0], images, id]
+         SET title=$1, slug=$2, category=$3, content=$4, image_url=$5, images=$6
+         WHERE id=$7 RETURNING *`,
+        [title, slug, category, content, images[0], images, id]
       );
 
-      // Remove photos the admin deleted (after the DB update succeeded)
-      const removed = existing.images.filter((url) => !kept.includes(url));
+      // Remove pictures that are no longer used (after the DB update succeeded)
+      const removed = fromArticle.length
+        ? existing.images.filter((url) => !images.includes(url))
+        : [];
       await Promise.all(removed.map((url) => deleteFromR2(url).catch(() => {})));
 
       return reply.send({ success: true, data: normalize(result.rows[0]) });
